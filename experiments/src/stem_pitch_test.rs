@@ -1,5 +1,3 @@
-//! stem_test plus pitch shifting: the chosen stems are mixed, then shifted.
-//!
 //! Usage:
 //!   stem_pitch_test --list
 //!   stem_pitch_test [--mix backing] [--semitones 0] [--hop 0.4] [--lookahead 0.12] [--xfade 0.05] [--cushion 0.25]
@@ -19,7 +17,7 @@ use std::time::{Duration, Instant};
 use ort::ep;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use soundtouch::SoundTouch;
+use rubberband::{Options, Stretcher};
 use windows::core::HSTRING;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -192,6 +190,69 @@ fn capture_thread(id: String, sh: Arc<Shared>) -> Res<()> {
     Ok(())
 }
 
+const RB_CHUNK: usize = 4096; 
+
+struct Shifter {
+    rb: Stretcher,
+    discard: usize, 
+}
+
+impl Shifter {
+    fn new(semitones: f64) -> Self {
+        let mut rb = Stretcher::new(
+            RATE as u32,
+            CH as u32,
+            Options::PROCESS_REALTIME | Options::ENGINE_FINER | Options::CHANNELS_TOGETHER,
+            1.0,
+            2f64.powf(semitones / 12.0),
+        );
+        rb.set_max_process_size(RB_CHUNK as u32);
+        let pad = rb.preferred_start_pad() as usize;
+        let discard = rb.start_delay() as usize;
+        println!(
+            "Pitch engine: engine R{}, start pad {} ms, start delay {} ms",
+            rb.engine_version(),
+            pad * 1000 / RATE,
+            discard * 1000 / RATE
+        );
+        let mut s = Shifter { rb, discard };
+        s.run(&vec![0f32; pad * CH]);
+        s
+    }
+
+    fn run(&mut self, input: &[f32]) -> Vec<f32> {
+        let frames = input.len() / CH;
+        let (mut l, mut r) = (vec![0f32; RB_CHUNK], vec![0f32; RB_CHUNK]);
+        let (mut out_l, mut out_r) = (vec![0f32; RB_CHUNK], vec![0f32; RB_CHUNK]);
+        let mut out = Vec::with_capacity(input.len());
+        let mut pos = 0;
+        while pos < frames {
+            let n = RB_CHUNK.min(frames - pos);
+            for i in 0..n {
+                l[i] = input[(pos + i) * CH];
+                r[i] = input[(pos + i) * CH + 1];
+            }
+            self.rb.process(&[&l[..n], &r[..n]], false);
+            pos += n;
+            loop {
+                let avail = self.rb.available().unwrap_or(0) as usize;
+                if avail == 0 {
+                    break;
+                }
+                let take = avail.min(RB_CHUNK);
+                let got = self.rb.retrieve(&mut [&mut out_l[..take], &mut out_r[..take]]) as usize;
+                let skip = self.discard.min(got);
+                self.discard -= skip;
+                for i in skip..got {
+                    out.push(out_l[i]);
+                    out.push(out_r[i]);
+                }
+            }
+        }
+        out
+    }
+}
+
 fn worker_thread(model: PathBuf, look: usize, xf: usize, semitones: f64, sh: Arc<Shared>) -> Res<()> {
     let mut session = Session::builder()
         .map_err(oe)?
@@ -215,12 +276,7 @@ fn worker_thread(model: PathBuf, look: usize, xf: usize, semitones: f64, sh: Arc
     let mut tail: Option<Vec<f32>> = None;
     let mut k: u64 = 0;
 
-    let mut shifter = (semitones != 0.0).then(|| {
-        let mut s = SoundTouch::new();
-        s.set_channels(CH as u32).set_sample_rate(RATE as u32).set_pitch(2f64.powf(semitones / 12.0));
-        s
-    });
-    let mut shifted = vec![0f32; 4096 * CH];
+    let mut shifter = (semitones != 0.0).then(|| Shifter::new(semitones));
 
     'outer: loop {
         let s = k * hop as u64; // absolute frame where this block starts
@@ -298,18 +354,7 @@ fn worker_thread(model: PathBuf, look: usize, xf: usize, semitones: f64, sh: Arc
             *v = v.clamp(-1.0, 1.0);
         }
         let emit = match shifter.as_mut() {
-            Some(s) => {
-                s.put_samples(&emit, emit.len() / CH);
-                let mut out: Vec<f32> = Vec::new();
-                loop {
-                    let got = s.receive_samples(&mut shifted, 4096);
-                    if got == 0 {
-                        break;
-                    }
-                    out.extend_from_slice(&shifted[..got * CH]);
-                }
-                out
-            }
+            Some(s) => s.run(&emit),
             None => emit,
         };
         sh.out.lock().unwrap().extend(emit);
@@ -349,7 +394,7 @@ fn render_thread(id: String, sh: Arc<Shared>) -> Res<()> {
         render.ReleaseBuffer(buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
         client.Start()?;
 
-        let arm_at = sh.hop * CH; 
+        let arm_at = sh.hop * CH * 6 / 10;  
         let mut armed = false;
         while !sh.stop.load(Ordering::Relaxed) {
             if WaitForSingleObject(event, 200) != WAIT_OBJECT_0 {
