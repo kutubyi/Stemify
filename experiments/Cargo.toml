@@ -1,0 +1,36 @@
+[package]
+name = "experiments"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cable_test"
+path = "src/cable_test.rs"
+
+[[bin]]
+name = "pitch_test"
+path = "src/pitch_test.rs"
+
+[[bin]]
+name = "stem_test"
+path = "src/stem_test.rs"
+
+[dependencies]
+ctrlc = "3"
+soundtouch = "0.5"
+# ONNX Runtime is loaded at run time from a pip-installed onnxruntime-gpu (see stem_test.rs).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "cuda", "api-27"] }
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+]
