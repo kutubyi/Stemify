@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["app/backend", "crates/engine"]
+exclude = ["experiments"]
+
+# Release build settings (Tauri's recommended ones). Cargo only honors profiles set here,
+# at the workspace root. See https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
