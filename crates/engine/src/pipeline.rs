@@ -84,6 +84,7 @@ impl Shared {
 pub struct Pipeline {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    output_id: String,
 }
 
 impl Pipeline {
@@ -112,11 +113,11 @@ impl Pipeline {
             threads.push(thread::spawn(move || processor_thread(&shared, separator, tx)));
         }
         {
-            let shared = shared.clone();
-            threads.push(thread::spawn(move || render_thread(&output_id, &shared, tx)));
+            let (shared, id) = (shared.clone(), output_id.clone());
+            threads.push(thread::spawn(move || render_thread(&id, &shared, tx)));
         }
 
-        let pipeline = Pipeline { shared, threads };
+        let pipeline = Pipeline { shared, threads, output_id };
         for _ in 0..3 {
             match rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ok(())) => {}
@@ -125,6 +126,10 @@ impl Pipeline {
             }
         }
         Ok(pipeline)
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.threads.iter().all(|thread| !thread.is_finished()) && default_output_id().is_ok_and(|id| id == self.output_id)
     }
 
     pub fn is_windowed(&self) -> bool {

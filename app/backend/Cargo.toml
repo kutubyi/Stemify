@@ -21,3 +21,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 engine = { path = "../../crates/engine" }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"

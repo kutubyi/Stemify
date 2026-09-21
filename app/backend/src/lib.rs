@@ -78,6 +78,8 @@ fn shutdown_engine(engine: Arc<engine::Engine>) {
 
 pub fn run() {
     tauri::Builder::default()
+        // Must come first: a second copy would fight the first over Spotify's routing.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .setup(|app| {
             let events = app.handle().clone();
             let engine = engine::Engine::start(move |state| {

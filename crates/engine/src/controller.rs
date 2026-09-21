@@ -255,6 +255,10 @@ impl Supervisor {
         if self.pipeline.as_ref().is_some_and(|p| p.is_windowed() != separator.is_some()) {
             self.pipeline = None;
         }
+        if self.pipeline.as_ref().is_some_and(|p| !p.healthy()) {
+            eprintln!("[audio] the output device changed or stopped: restarting");
+            self.pipeline = None;
+        }
         match &self.pipeline {
             Some(pipeline) => {
                 pipeline.set_semitones(state.semitones);
