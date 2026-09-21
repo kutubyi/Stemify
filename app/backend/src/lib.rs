@@ -1,89 +1,31 @@
-mod routing;
-mod spotify;
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-#[derive(Clone, Serialize)]
-struct EngineState {
-    enabled: bool,
-    semitones: i32,
-    stems: Vec<String>,
-    status: String,
-}
+struct EngineHandle(Arc<engine::Engine>);
 
-impl Default for EngineState {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            semitones: 0,
-            stems: ["vocals", "drums", "bass", "guitar", "piano", "other"].map(String::from).to_vec(),
-            status: "off".into(),
-        }
-    }
-}
-
-struct Engine(Arc<Mutex<EngineState>>);
-
-fn publish(app: &AppHandle, state: &EngineState) {
-    let _ = app.emit("engine-status", state.clone());
-}
-
-fn settle_later(app: AppHandle, state: Arc<Mutex<EngineState>>, ms: u64) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(ms));
-        let mut s = state.lock().unwrap();
-        if s.enabled && s.status == "loading" {
-            s.status = "ready".into();
-            publish(&app, &s);
-        }
-    });
-}
-
-fn update(app: &AppHandle, engine: &Engine, settle_ms: u64, change: impl FnOnce(&mut EngineState)) -> EngineState {
-    let snapshot = {
-        let mut s = engine.0.lock().unwrap();
-        change(&mut s);
-        s.status = if s.enabled { "loading" } else { "off" }.into();
-        s.clone()
-    };
-    publish(app, &snapshot);
-    if snapshot.enabled {
-        settle_later(app.clone(), engine.0.clone(), settle_ms);
-    }
-    snapshot
+#[tauri::command]
+fn get_state(handle: State<EngineHandle>) -> engine::State {
+    handle.0.state()
 }
 
 #[tauri::command]
-fn get_state(engine: State<Engine>) -> EngineState {
-    engine.0.lock().unwrap().clone()
+fn set_enabled(enabled: bool, handle: State<EngineHandle>) -> engine::State {
+    handle.0.set_enabled(enabled)
 }
 
 #[tauri::command]
-fn spotify_connected(connected: State<spotify::Connected>) -> bool {
-    connected.0.load(Ordering::Relaxed)
+fn set_pitch(semitones: i32, handle: State<EngineHandle>) -> engine::State {
+    handle.0.set_pitch(semitones)
 }
 
 #[tauri::command]
-fn set_enabled(enabled: bool, app: AppHandle, engine: State<Engine>) -> EngineState {
-    update(&app, &engine, 2000, |s| s.enabled = enabled)
-}
-
-#[tauri::command]
-fn set_pitch(semitones: i32, app: AppHandle, engine: State<Engine>) -> EngineState {
-    update(&app, &engine, 800, |s| s.semitones = semitones.clamp(-12, 12))
-}
-
-#[tauri::command]
-fn set_stems(stems: Vec<String>, app: AppHandle, engine: State<Engine>) -> EngineState {
-    update(&app, &engine, 1500, |s| s.stems = stems)
+fn set_stems(stems: Vec<String>, handle: State<EngineHandle>) -> engine::State {
+    handle.0.set_stems(stems)
 }
 
 fn show_window(app: &AppHandle) {
@@ -118,36 +60,34 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-fn restore_routing_on_exit() {
-    let (tx, rx) = mpsc::channel();
+fn shutdown_engine(engine: Arc<engine::Engine>) {
+    let (done, wait) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(routing::restore_spotify_if_on_cable());
+        engine.shutdown();
+        let _ = done.send(());
     });
-    match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(Ok(message)) => eprintln!("[exit] routing: {message}"),
-        Ok(Err(error)) => eprintln!("[exit] routing: could not check Spotify's output: {error}"),
-        Err(_) => eprintln!("[exit] routing: timed out"),
+    if wait.recv_timeout(Duration::from_secs(3)).is_err() {
+        eprintln!("[exit] the engine took too long to stop, so it was skipped");
     }
 }
 
 pub fn run() {
     tauri::Builder::default()
-        .manage(Engine(Arc::new(Mutex::new(EngineState::default()))))
-        .manage(spotify::Connected(AtomicBool::new(false)))
         .setup(|app| {
-            setup_tray(app)?;
-            spotify::start_watcher(app.handle().clone(), |app| {
-                let engine = app.state::<Engine>();
-                update(app, &engine, 0, |s| s.enabled = false);
+            let events = app.handle().clone();
+            let engine = engine::Engine::start(move |state| {
+                let _ = events.emit("engine-status", state.clone());
             });
+            app.manage(EngineHandle(Arc::new(engine)));
+            setup_tray(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_state, spotify_connected, set_enabled, set_pitch, set_stems])
+        .invoke_handler(tauri::generate_handler![get_state, set_enabled, set_pitch, set_stems])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                restore_routing_on_exit();
+                shutdown_engine(app.state::<EngineHandle>().0.clone());
             }
         });
 }

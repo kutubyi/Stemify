@@ -3,22 +3,32 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
-  type EngineState = { enabled: boolean; semitones: number; stems: string[]; status: string };
+  type EngineState = {
+    enabled: boolean;
+    semitones: number;
+    stems: string[];
+    status: "off" | "loading" | "waiting" | "ready";
+    spotify_connected: boolean;
+    error: string | null;
+  };
 
   const ALL_STEMS = ["vocals", "drums", "bass", "guitar", "piano", "other"];
 
+  const STATUS_TEXT = {
+    off: "Off",
+    loading: "Starting…",
+    waiting: "Play something in Spotify…",
+    ready: "On: Spotify is playing through Stemify",
+  };
+
   let engine = $state<EngineState | null>(null);
-  let spotifyConnected = $state(false);
 
   onMount(() => {
     // Ask Rust for the current state once, then listen for every change it pushes.
     invoke<EngineState>("get_state").then((s) => (engine = s));
-    invoke<boolean>("spotify_connected").then((c) => (spotifyConnected = c));
-    const unlistenSpotify = listen<boolean>("spotify-status", (e) => (spotifyConnected = e.payload));
     const unlisten = listen<EngineState>("engine-status", (e) => (engine = e.payload));
     return () => {
       unlisten.then((stop) => stop());
-      unlistenSpotify.then((stop) => stop());
     };
   });
 
@@ -40,18 +50,19 @@
   {#if engine}
     <header>
       <h1>Stemify</h1>
-      <button class="power" class:on={engine.enabled} onclick={togglePower}>
+      <button class="power" class:on={engine.enabled} disabled={!engine.spotify_connected} onclick={togglePower}>
         {engine.enabled ? "On" : "Off"}
       </button>
     </header>
 
-    <p class="spotify" class:waiting={!spotifyConnected}>
-      {spotifyConnected ? "Spotify connected" : "Waiting for Spotify… open Spotify to start"}
+    <p class="spotify" class:waiting={!engine.spotify_connected}>
+      {engine.spotify_connected ? "Spotify connected" : "Waiting for Spotify… open Spotify to start"}
     </p>
 
-    <p class="status {engine.status}">
-      {engine.status === "loading" ? "Loading…" : engine.status === "ready" ? "Ready" : "Off"}
-    </p>
+    <p class="status {engine.status}">{STATUS_TEXT[engine.status]}</p>
+    {#if engine.error}
+      <p class="error">{engine.error}</p>
+    {/if}
 
     <section class:dim={engine.status === "loading"}>
       <h2>Transpose: {engine.semitones > 0 ? "+" : ""}{engine.semitones}</h2>
@@ -136,8 +147,18 @@
     margin: 6px 0 0;
     font-size: 13px;
   }
-  .status.loading {
+  .status.loading,
+  .status.waiting {
     color: #e6b34a;
+  }
+  .error {
+    margin: 6px 0 0;
+    font-size: 12px;
+    color: #f0736a;
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
   .status.ready {
     color: #5ecb7a;
