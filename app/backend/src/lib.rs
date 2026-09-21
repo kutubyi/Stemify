@@ -28,6 +28,11 @@ fn set_stems(stems: Vec<String>, handle: State<EngineHandle>) -> engine::State {
     handle.0.set_stems(stems)
 }
 
+#[tauri::command]
+fn set_keep_model(keep: bool, handle: State<EngineHandle>) -> engine::State {
+    handle.0.set_keep_model(keep)
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -82,7 +87,7 @@ pub fn run() {
             setup_tray(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_state, set_enabled, set_pitch, set_stems])
+        .invoke_handler(tauri::generate_handler![get_state, set_enabled, set_pitch, set_stems, set_keep_model])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {

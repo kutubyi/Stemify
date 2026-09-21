@@ -7,6 +7,7 @@
     enabled: boolean;
     semitones: number;
     stems: string[];
+    keep_model: boolean;
     status: "off" | "loading" | "waiting" | "idle" | "ready";
     spotify_connected: boolean;
     error: string | null;
@@ -44,6 +45,9 @@
     if (!engine) return;
     const stems = engine.stems.includes(stem) ? engine.stems.filter((s) => s !== stem) : [...engine.stems, stem];
     engine = await invoke<EngineState>("set_stems", { stems });
+  }
+  async function setKeepModel(keep: boolean) {
+    engine = await invoke<EngineState>("set_keep_model", { keep });
   }
 </script>
 
@@ -87,6 +91,15 @@
           </button>
         {/each}
       </div>
+
+      <label class="keep">
+        <input
+          type="checkbox"
+          checked={engine.keep_model}
+          onchange={(e) => setKeepModel((e.target as HTMLInputElement).checked)}
+        />
+        Keep the stem model in GPU memory when off
+      </label>
     </section>
   {:else}
     <p>Connecting…</p>
@@ -190,6 +203,12 @@
     border-color: #2f6df6;
     color: #f2f2f2;
     background: #26304a;
+  }
+  .keep {
+    display: block;
+    margin-top: 18px;
+    font-size: 12px;
+    color: #a0a0a8;
   }
   .dim {
     opacity: 0.45;

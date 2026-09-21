@@ -7,24 +7,19 @@ use serde::Serialize;
 
 use crate::pipeline::Pipeline;
 use crate::routing::{self, Restore, RouteError};
+use crate::separator::{stems_mask, Separator, ALL_MASK};
 
 const TICK: Duration = Duration::from_millis(200);
-/// Ticks in a row that must find Spotify missing before we believe it has quit (3 seconds).
 const GONE_CHECKS: u32 = 15;
-/// How often (in ticks) to look for a routing left behind (once a second).
 const CHECK_EVERY_TICKS: u32 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Off,
-    /// Starting up.
     Loading,
-    /// On, but Spotify has not played sound yet, so it cannot be routed.
     Waiting,
-    /// On, but there is nothing to change yet, so Spotify plays untouched.
     Idle,
-    /// Spotify's audio is flowing through Stemify.
     Ready,
 }
 
@@ -33,6 +28,7 @@ pub struct State {
     pub enabled: bool,
     pub semitones: i32,
     pub stems: Vec<String>,
+    pub keep_model: bool,
     pub status: Status,
     pub spotify_connected: bool,
     pub error: Option<String>,
@@ -44,6 +40,7 @@ impl Default for State {
             enabled: false,
             semitones: 0,
             stems: ["vocals", "drums", "bass", "guitar", "piano", "other"].map(String::from).to_vec(),
+            keep_model: false,
             status: Status::Off,
             spotify_connected: false,
             error: None,
@@ -85,7 +82,7 @@ pub struct Engine {
 impl Engine {
     pub fn start(on_change: impl Fn(&State) + Send + Sync + 'static) -> Engine {
         let inner = Arc::new(Inner { state: Mutex::new(State::default()), on_change: Box::new(on_change), stop: AtomicBool::new(false) });
-        let supervisor = Supervisor { inner: inner.clone(), watch: Watch::default(), pipeline: None, routed: false, needs_check: true, ticks: 0 };
+        let supervisor = Supervisor { inner: inner.clone(), watch: Watch::default(), pipeline: None, model: Model::None, routed: false, needs_check: true, ticks: 0 };
         let thread = thread::spawn(move || supervisor.run());
         Engine { inner, thread: Mutex::new(Some(thread)) }
     }
@@ -113,6 +110,10 @@ impl Engine {
 
     pub fn set_stems(&self, stems: Vec<String>) -> State {
         self.inner.change(|s| s.stems = stems)
+    }
+
+    pub fn set_keep_model(&self, keep: bool) -> State {
+        self.inner.change(|s| s.keep_model = keep)
     }
 
     pub fn shutdown(&self) {
@@ -156,14 +157,18 @@ impl Watch {
     }
 }
 
+enum Model {
+    None,
+    Loading(JoinHandle<Result<Separator, String>>),
+    Ready(Arc<Mutex<Separator>>),
+}
+
 struct Supervisor {
     inner: Arc<Inner>,
     watch: Watch,
     pipeline: Option<Pipeline>,
-    /// Is Spotify currently routed to the cable by us?
+    model: Model,
     routed: bool,
-    /// Might Spotify be left routed to the cable (a crash, or Spotify quitting while routed)?
-    /// Checked whenever Spotify is running and we are not routing, until a check succeeds.
     needs_check: bool,
     ticks: u32,
 }
@@ -179,13 +184,11 @@ impl Supervisor {
     }
 
     fn tick(&mut self) {
-        // If we cannot tell (the process list failed), change nothing this round.
         let Some(running) = routing::spotify_running() else { return };
         let verdict = self.watch.observe(running);
 
         if verdict == Verdict::Gone {
             eprintln!("[spotify] Spotify has quit: waiting for it to open again");
-            // Its routing can no longer be undone from here; it is reset when Spotify returns.
             self.pipeline = None;
             self.routed = false;
             self.needs_check = true;
@@ -208,21 +211,58 @@ impl Supervisor {
         if !state.enabled {
             self.stand_down(connected);
             self.inner.change(|s| s.status = Status::Off);
-        } else if state.semitones == 0 {
+        } else if state.semitones == 0 && stems_mask(&state.stems) == ALL_MASK {
             self.stand_down(connected);
             self.inner.change(|s| s.status = Status::Idle);
         } else {
-            self.process(state.semitones);
+            self.process(&state);
         }
     }
 
-    /// Something needs changing: make sure the pipeline is running and Spotify is routed to it.
-    fn process(&mut self, semitones: i32) {
+    fn separator(&mut self) -> Result<Option<Arc<Mutex<Separator>>>, String> {
+        self.model = match std::mem::replace(&mut self.model, Model::None) {
+            Model::None => Model::Loading(thread::spawn(Separator::load)),
+            Model::Loading(handle) if handle.is_finished() => match handle.join() {
+                Ok(Ok(separator)) => Model::Ready(Arc::new(Mutex::new(separator))),
+                Ok(Err(message)) => return Err(message),
+                Err(_) => return Err("Loading the stem model failed.".into()),
+            },
+            model => model,
+        };
+        Ok(match &self.model {
+            Model::Ready(separator) => Some(separator.clone()),
+            _ => None,
+        })
+    }
+
+    fn process(&mut self, state: &State) {
+        let mask = stems_mask(&state.stems);
+        let mut separator = None;
+        if mask != ALL_MASK {
+            match self.separator() {
+                Ok(Some(ready)) => separator = Some(ready),
+                Ok(None) => {
+                    self.inner.change(|s| s.status = Status::Loading);
+                    return;
+                }
+                Err(message) => {
+                    self.model = Model::None;
+                    return self.fail(message);
+                }
+            }
+        }
+
+        if self.pipeline.as_ref().is_some_and(|p| p.is_windowed() != separator.is_some()) {
+            self.pipeline = None;
+        }
         match &self.pipeline {
-            Some(pipeline) => pipeline.set_semitones(semitones),
+            Some(pipeline) => {
+                pipeline.set_semitones(state.semitones);
+                pipeline.set_stems(mask);
+            }
             None => {
                 self.inner.change(|s| s.status = Status::Loading);
-                match Pipeline::start(semitones) {
+                match Pipeline::start(state.semitones, mask, separator) {
                     Ok(pipeline) => self.pipeline = Some(pipeline),
                     Err(message) => return self.fail(message),
                 }
@@ -241,7 +281,6 @@ impl Supervisor {
         self.inner.change(|s| s.status = Status::Ready);
     }
 
-    /// Nothing needs changing: leave Spotify untouched.
     fn stand_down(&mut self, spotify_connected: bool) {
         if self.routed {
             match routing::restore_spotify_if_on_cable() {
@@ -250,10 +289,11 @@ impl Supervisor {
             }
             self.routed = false;
         }
-        self.pipeline = None; // after the reset, so Spotify is never left without an output
+        self.pipeline = None; 
+        if matches!(self.model, Model::Ready(_)) && !self.inner.state().keep_model {
+            self.model = Model::None; // give the GPU memory back
+        }
 
-        // A routing may have been left behind. It can only be read and reset once Spotify has
-        // played sound, so keep asking until Spotify answers.
         if spotify_connected && self.needs_check && self.ticks % CHECK_EVERY_TICKS == 0 {
             match routing::restore_spotify_if_on_cable() {
                 Ok(Restore::NoAudioSession) | Err(_) => {}
@@ -265,7 +305,6 @@ impl Supervisor {
         }
     }
 
-    /// Turning on did not work: undo whatever was started and say why.
     fn fail(&mut self, message: String) {
         eprintln!("[engine] {message}");
         self.pipeline = None;
@@ -276,7 +315,6 @@ impl Supervisor {
         });
     }
 
-    /// The engine is shutting down: leave Spotify on its default output device.
     fn finish(&mut self) {
         match routing::restore_spotify_if_on_cable() {
             Ok(result) => eprintln!("[exit] routing: {result}"),

@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rubberband = "0.1"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "cuda", "api-27"] }
 
 [dependencies.windows]
 version = "0.61"
