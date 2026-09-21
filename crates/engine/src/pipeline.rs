@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rubberband::{Options, Stretcher};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
@@ -14,11 +15,12 @@ use crate::routing::{com_init, outputs};
 
 type WinResult<T> = windows::core::Result<T>;
 
-const RATE: usize = 44_100; 
+const RATE: usize = 44_100;
 const CH: usize = 2;
-const PREBUFFER_MS: usize = 100; 
-const MAX_DEPTH_MS: usize = 400; 
+const PREBUFFER_MS: usize = 100;
+const MAX_DEPTH_MS: usize = 400;
 const TRIM_TO_MS: usize = 150;
+const RB_CHUNK: usize = 4096;
 
 fn fmt() -> WAVEFORMATEX {
     WAVEFORMATEX {
@@ -39,6 +41,7 @@ struct Shared {
     ring: Mutex<VecDeque<f32>>,
     stop: AtomicBool,
     underruns: AtomicU64,
+    semitones: AtomicI32,
 }
 
 pub struct Pipeline {
@@ -47,7 +50,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn start() -> Result<Pipeline, String> {
+    pub fn start(semitones: i32) -> Result<Pipeline, String> {
         com_init().map_err(|e| e.to_string())?;
 
         let cable = outputs()
@@ -60,7 +63,7 @@ impl Pipeline {
             return Err("The default output device is the virtual cable. Choose your speakers or headphones as the Windows default output.".into());
         }
 
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared { semitones: AtomicI32::new(semitones), ..Default::default() });
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         let mut threads = Vec::new();
         {
@@ -82,6 +85,10 @@ impl Pipeline {
         }
         Ok(pipeline)
     }
+
+    pub fn set_semitones(&self, semitones: i32) {
+        self.shared.semitones.store(semitones, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Pipeline {
@@ -100,6 +107,73 @@ fn enumerator() -> WinResult<IMMDeviceEnumerator> {
 
 fn default_output_id() -> WinResult<String> {
     unsafe { Ok(enumerator()?.GetDefaultAudioEndpoint(eRender, eConsole)?.GetId()?.to_string()?) }
+}
+
+fn pitch_scale(semitones: i32) -> f64 {
+    2f64.powf(semitones as f64 / 12.0)
+}
+
+struct Shifter {
+    rb: Stretcher,
+    semitones: i32,
+    discard: usize,
+}
+
+impl Shifter {
+    fn new(semitones: i32) -> Self {
+        let mut rb = Stretcher::new(
+            RATE as u32,
+            CH as u32,
+            Options::PROCESS_REALTIME | Options::ENGINE_FINER | Options::CHANNELS_TOGETHER,
+            1.0,
+            pitch_scale(semitones),
+        );
+        rb.set_max_process_size(RB_CHUNK as u32);
+        let pad = rb.preferred_start_pad() as usize;
+        let discard = rb.start_delay() as usize;
+        let mut shifter = Shifter { rb, semitones, discard };
+        shifter.run(&vec![0f32; pad * CH]);
+        shifter
+    }
+
+    fn set_semitones(&mut self, semitones: i32) {
+        if semitones != self.semitones {
+            self.rb.set_pitch_scale(pitch_scale(semitones));
+            self.semitones = semitones;
+        }
+    }
+
+    fn run(&mut self, input: &[f32]) -> Vec<f32> {
+        let frames = input.len() / CH;
+        let (mut l, mut r) = (vec![0f32; RB_CHUNK], vec![0f32; RB_CHUNK]);
+        let (mut out_l, mut out_r) = (vec![0f32; RB_CHUNK], vec![0f32; RB_CHUNK]);
+        let mut out = Vec::with_capacity(input.len());
+        let mut pos = 0;
+        while pos < frames {
+            let n = RB_CHUNK.min(frames - pos);
+            for i in 0..n {
+                l[i] = input[(pos + i) * CH];
+                r[i] = input[(pos + i) * CH + 1];
+            }
+            self.rb.process(&[&l[..n], &r[..n]], false);
+            pos += n;
+            loop {
+                let available = self.rb.available().unwrap_or(0) as usize;
+                if available == 0 {
+                    break;
+                }
+                let take = available.min(RB_CHUNK);
+                let got = self.rb.retrieve(&mut [&mut out_l[..take], &mut out_r[..take]]) as usize;
+                let skip = self.discard.min(got);
+                self.discard -= skip;
+                for i in skip..got {
+                    out.push(out_l[i]);
+                    out.push(out_r[i]);
+                }
+            }
+        }
+        out
+    }
 }
 
 struct Capture {
@@ -130,6 +204,7 @@ fn capture_thread(id: &str, shared: &Shared, ready: mpsc::Sender<Result<(), Stri
             return;
         }
     };
+    let mut shifter = Shifter::new(shared.semitones.load(Ordering::Relaxed));
     let _ = ready.send(Ok(()));
 
     unsafe {
@@ -153,8 +228,11 @@ fn capture_thread(id: &str, shared: &Shared, ready: mpsc::Sender<Result<(), Stri
                 };
                 let _ = capture.capture.ReleaseBuffer(frames);
 
+                shifter.set_semitones(shared.semitones.load(Ordering::Relaxed));
+                let shifted = shifter.run(&samples);
+
                 let mut ring = shared.ring.lock().unwrap();
-                ring.extend(samples);
+                ring.extend(shifted);
                 if ring.len() > MAX_DEPTH_MS * RATE / 1000 * CH {
                     let drop = ring.len() - TRIM_TO_MS * RATE / 1000 * CH;
                     ring.drain(..drop);

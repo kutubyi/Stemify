@@ -18,8 +18,13 @@ const CHECK_EVERY_TICKS: u32 = 5;
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Off,
+    /// Starting up.
     Loading,
+    /// On, but Spotify has not played sound yet, so it cannot be routed.
     Waiting,
+    /// On, but there is nothing to change yet, so Spotify plays untouched.
+    Idle,
+    /// Spotify's audio is flowing through Stemify.
     Ready,
 }
 
@@ -142,7 +147,7 @@ impl Watch {
         } else {
             self.missing += 1;
             if self.missing >= GONE_CHECKS {
-                *self = Watch::default(); 
+                *self = Watch::default();
                 Verdict::Gone
             } else {
                 Verdict::Connected
@@ -155,7 +160,10 @@ struct Supervisor {
     inner: Arc<Inner>,
     watch: Watch,
     pipeline: Option<Pipeline>,
+    /// Is Spotify currently routed to the cable by us?
     routed: bool,
+    /// Might Spotify be left routed to the cable (a crash, or Spotify quitting while routed)?
+    /// Checked whenever Spotify is running and we are not routing, until a check succeeds.
     needs_check: bool,
     ticks: u32,
 }
@@ -171,11 +179,13 @@ impl Supervisor {
     }
 
     fn tick(&mut self) {
+        // If we cannot tell (the process list failed), change nothing this round.
         let Some(running) = routing::spotify_running() else { return };
         let verdict = self.watch.observe(running);
 
         if verdict == Verdict::Gone {
             eprintln!("[spotify] Spotify has quit: waiting for it to open again");
+            // Its routing can no longer be undone from here; it is reset when Spotify returns.
             self.pipeline = None;
             self.routed = false;
             self.needs_check = true;
@@ -195,43 +205,55 @@ impl Supervisor {
         }
         let state = self.inner.change(|s| s.spotify_connected = connected);
 
-        if state.enabled {
-            self.while_on();
+        if !state.enabled {
+            self.stand_down(connected);
+            self.inner.change(|s| s.status = Status::Off);
+        } else if state.semitones == 0 {
+            self.stand_down(connected);
+            self.inner.change(|s| s.status = Status::Idle);
         } else {
-            self.while_off(connected);
+            self.process(state.semitones);
         }
     }
 
-    fn while_on(&mut self) {
-        if self.pipeline.is_none() {
-            self.inner.change(|s| s.status = Status::Loading);
-            match Pipeline::start() {
-                Ok(pipeline) => self.pipeline = Some(pipeline),
-                Err(message) => return self.fail(message),
+    /// Something needs changing: make sure the pipeline is running and Spotify is routed to it.
+    fn process(&mut self, semitones: i32) {
+        match &self.pipeline {
+            Some(pipeline) => pipeline.set_semitones(semitones),
+            None => {
+                self.inner.change(|s| s.status = Status::Loading);
+                match Pipeline::start(semitones) {
+                    Ok(pipeline) => self.pipeline = Some(pipeline),
+                    Err(message) => return self.fail(message),
+                }
             }
         }
         if !self.routed {
             match routing::route_spotify_to_cable() {
-                Ok(_) => {
-                    self.routed = true;
-                    self.inner.change(|s| s.status = Status::Ready);
-                }
+                Ok(_) => self.routed = true,
                 Err(RouteError::NoAudioSession) => {
                     self.inner.change(|s| s.status = Status::Waiting);
+                    return;
                 }
-                Err(RouteError::Failed(message)) => self.fail(message),
+                Err(RouteError::Failed(message)) => return self.fail(message),
             }
         }
+        self.inner.change(|s| s.status = Status::Ready);
     }
 
-    fn while_off(&mut self, spotify_connected: bool) {
+    /// Nothing needs changing: leave Spotify untouched.
+    fn stand_down(&mut self, spotify_connected: bool) {
         if self.routed {
-            self.reset_routing();
+            match routing::restore_spotify_if_on_cable() {
+                Ok(result) => eprintln!("[routing] {result}"),
+                Err(error) => eprintln!("[routing] could not reset Spotify's output: {error}"),
+            }
             self.routed = false;
         }
-        self.pipeline = None; 
-        self.inner.change(|s| s.status = Status::Off);
+        self.pipeline = None; // after the reset, so Spotify is never left without an output
 
+        // A routing may have been left behind. It can only be read and reset once Spotify has
+        // played sound, so keep asking until Spotify answers.
         if spotify_connected && self.needs_check && self.ticks % CHECK_EVERY_TICKS == 0 {
             match routing::restore_spotify_if_on_cable() {
                 Ok(Restore::NoAudioSession) | Err(_) => {}
@@ -243,13 +265,7 @@ impl Supervisor {
         }
     }
 
-    fn reset_routing(&self) {
-        match routing::restore_spotify_if_on_cable() {
-            Ok(result) => eprintln!("[routing] {result}"),
-            Err(error) => eprintln!("[routing] could not reset Spotify's output: {error}"),
-        }
-    }
-
+    /// Turning on did not work: undo whatever was started and say why.
     fn fail(&mut self, message: String) {
         eprintln!("[engine] {message}");
         self.pipeline = None;
@@ -260,6 +276,7 @@ impl Supervisor {
         });
     }
 
+    /// The engine is shutting down: leave Spotify on its default output device.
     fn finish(&mut self) {
         match routing::restore_spotify_if_on_cable() {
             Ok(result) => eprintln!("[exit] routing: {result}"),

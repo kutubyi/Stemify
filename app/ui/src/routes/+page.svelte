@@ -7,7 +7,7 @@
     enabled: boolean;
     semitones: number;
     stems: string[];
-    status: "off" | "loading" | "waiting" | "ready";
+    status: "off" | "loading" | "waiting" | "idle" | "ready";
     spotify_connected: boolean;
     error: string | null;
   };
@@ -18,6 +18,7 @@
     off: "Off",
     loading: "Starting…",
     waiting: "Play something in Spotify…",
+    idle: "On: Spotify is playing through Stemify",
     ready: "On: Spotify is playing through Stemify",
   };
 
@@ -160,6 +161,7 @@
     opacity: 0.4;
     cursor: not-allowed;
   }
+  .status.idle,
   .status.ready {
     color: #5ecb7a;
   }
