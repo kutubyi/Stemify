@@ -51,10 +51,9 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "engine",
  "tauri",
  "tauri-build",
- "windows",
 ]
 
 [[package]]
@@ -751,6 +750,10 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 [[package]]
 name = "engine"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "windows",
+]
 
 [[package]]
 name = "equivalent"
