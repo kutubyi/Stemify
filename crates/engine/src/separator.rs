@@ -24,19 +24,14 @@ fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("Stemify"))
 }
 
-fn init_ort(root: &Path) -> Result<(), String> {
+fn init_ort(runtime_dir: &Path) -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
-        let dirs = [
-            root.join("nvidia").join("cu13").join("bin").join("x86_64"),
-            root.join("nvidia").join("cudnn").join("bin"),
-            root.join("onnxruntime").join("capi"),
-        ];
-        let mut paths: Vec<PathBuf> = dirs.to_vec();
+        let mut paths = vec![runtime_dir.to_path_buf()];
         paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
         std::env::set_var("PATH", std::env::join_paths(paths).map_err(oe)?);
 
-        let dll = root.join("onnxruntime").join("capi").join("onnxruntime.dll");
+        let dll = runtime_dir.join("onnxruntime.dll");
         ort::init_from(&dll)
             .map_err(oe)?
             .with_execution_providers([ep::CUDA::default().build().error_on_failure()])
@@ -57,7 +52,7 @@ impl Separator {
         if !model.exists() {
             return Err(format!("The stem model was not found at {}.", model.display()));
         }
-        init_ort(&data.join("venv-cuda").join("Lib").join("site-packages")).map_err(|e| format!("Could not start the GPU runtime: {e}"))?;
+        init_ort(&data.join("runtime")).map_err(|e| format!("Could not start the GPU runtime: {e}"))?;
 
         let session = Session::builder()
             .map_err(oe)?
