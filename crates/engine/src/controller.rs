@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::nowplaying::{self, Track};
 use crate::pipeline::Pipeline;
 use crate::routing::{self, Restore, RouteError};
 use crate::separator::{stems_mask, Separator, ALL_MASK};
@@ -12,6 +13,7 @@ use crate::separator::{stems_mask, Separator, ALL_MASK};
 const TICK: Duration = Duration::from_millis(200);
 const GONE_CHECKS: u32 = 15;
 const CHECK_EVERY_TICKS: u32 = 5;
+const TRACK_POLL_TICKS: u32 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,6 +34,7 @@ pub struct State {
     pub status: Status,
     pub spotify_connected: bool,
     pub error: Option<String>,
+    pub track: Option<Track>,
 }
 
 impl Default for State {
@@ -44,6 +47,7 @@ impl Default for State {
             status: Status::Off,
             spotify_connected: false,
             error: None,
+            track: None,
         }
     }
 }
@@ -184,6 +188,11 @@ impl Supervisor {
     }
 
     fn tick(&mut self) {
+        if self.ticks % TRACK_POLL_TICKS == 0 {
+            let track = nowplaying::current();
+            self.inner.change(|s| s.track = track);
+        }
+
         let Some(running) = routing::spotify_running() else { return };
         let verdict = self.watch.observe(running);
 

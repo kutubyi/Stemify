@@ -5,6 +5,8 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
+use window_vibrancy::apply_acrylic;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 
 struct EngineHandle(Arc<engine::Engine>);
 
@@ -78,7 +80,6 @@ fn shutdown_engine(engine: Arc<engine::Engine>) {
 
 pub fn run() {
     tauri::Builder::default()
-        // Must come first: a second copy would fight the first over Spotify's routing.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .setup(|app| {
             let events = app.handle().clone();
@@ -87,6 +88,21 @@ pub fn run() {
             });
             app.manage(EngineHandle(Arc::new(engine)));
             setup_tray(app)?;
+            let window = app.get_webview_window("main").expect("main window");
+            if let Err(error) = apply_acrylic(&window, Some((18, 18, 18, 125))) {
+                eprintln!("[ui] acrylic background not available: {error}");
+            }
+            if let Ok(hwnd) = window.hwnd() {
+                let dark: i32 = 1;
+                unsafe {
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        &dark as *const _ as *const std::ffi::c_void,
+                        std::mem::size_of::<i32>() as u32,
+                    );
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_state, set_enabled, set_pitch, set_stems, set_keep_model])
